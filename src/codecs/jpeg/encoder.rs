@@ -1,8 +1,5 @@
 #![allow(clippy::too_many_arguments)]
 
-use std::borrow::Cow;
-use std::io::{self, Write};
-
 use crate::error::{
     ImageError, ImageResult, ParameterError, ParameterErrorKind, UnsupportedError,
     UnsupportedErrorKind,
@@ -10,6 +7,9 @@ use crate::error::{
 use crate::image::{ImageEncoder, ImageFormat};
 use crate::utils::clamp;
 use crate::{ExtendedColorType, GenericImageView, ImageBuffer, Luma, Pixel, Rgb};
+use num_traits::ToPrimitive;
+use std::borrow::Cow;
+use std::io::{self, Write};
 
 use super::entropy::build_huff_lut_const;
 use super::transform;
@@ -775,16 +775,27 @@ fn rgb_to_ycbcr<P: Pixel>(pixel: P) -> (u8, u8, u8) {
     use num_traits::cast::ToPrimitive;
 
     let [r, g, b] = pixel.to_rgb().0;
-    let max: f32 = P::Subpixel::DEFAULT_MAX_VALUE.to_f32().unwrap();
-    let r: f32 = r.to_f32().unwrap();
-    let g: f32 = g.to_f32().unwrap();
-    let b: f32 = b.to_f32().unwrap();
+    // let max: f32 = P::Subpixel::DEFAULT_MAX_VALUE.to_f32().unwrap();
+    // let r: f32 = r.to_f32().unwrap();
+    // let g: f32 = g.to_f32().unwrap();
+    // let b: f32 = b.to_f32().unwrap();
+    //
+    // // Coefficients from JPEG File Interchange Format (Version 1.02), multiplied for 255 maximum.
+    // let y = 76.245 / max * r + 149.685 / max * g + 29.07 / max * b;
+    // let cb = -43.0185 / max * r - 84.4815 / max * g + 127.5 / max * b + 128.;
+    // let cr = 127.5 / max * r - 106.7685 / max * g - 20.7315 / max * b + 128.;
+    //
+    // (y as u8, cb as u8, cr as u8)
 
-    // Coefficients from JPEG File Interchange Format (Version 1.02), multiplied for 255 maximum.
-    let y = 76.245 / max * r + 149.685 / max * g + 29.07 / max * b;
-    let cb = -43.0185 / max * r - 84.4815 / max * g + 127.5 / max * b + 128.;
-    let cr = 127.5 / max * r - 106.7685 / max * g - 20.7315 / max * b + 128.;
+    let r: i32 = r.to_u8().unwrap() as i32;
+    let g: i32 = g.to_u8().unwrap() as i32;
+    let b: i32 = b.to_u8().unwrap() as i32;
 
+    const Y_BIAS: i32 = 1 << 15; // + 0.5 is needed to simulate rounding shift right in-place
+    const UV_BIAS: i32 = (128 << 16) + (1 << 15); // + 0.5 is needed to simulate rounding shift right in-place
+    let y = (19595 * r + 38470 * g + 7471 * b + Y_BIAS) >> 16;
+    let cb = (-11059 * r - 21709 * g + 32768 * b + UV_BIAS) >> 16;
+    let cr = (32768 * r - 27439 * g - 5329 * b + UV_BIAS) >> 16;
     (y as u8, cb as u8, cr as u8)
 }
 
