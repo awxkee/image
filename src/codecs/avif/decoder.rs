@@ -35,6 +35,7 @@ pub struct AvifDecoder<R> {
 enum AvifDecoderError {
     AlphaPlaneFormat(PixelLayout),
     YuvLayoutOnIdentityMatrix(PixelLayout),
+    UnsupportedLayoutAndMatrix(PixelLayout, YuvStandardMatrix),
 }
 
 impl Display for AvifDecoderError {
@@ -42,22 +43,25 @@ impl Display for AvifDecoderError {
         match self {
             AvifDecoderError::AlphaPlaneFormat(pixel_layout) => match pixel_layout {
                 PixelLayout::I400 => unreachable!("This option must be handled correctly"),
-                PixelLayout::I420 => f.write_str("Alpha layout must be 4:0:0 but it was 4:2:0"),
-                PixelLayout::I422 => f.write_str("Alpha layout must be 4:0:0 but it was 4:2:2"),
-                PixelLayout::I444 => f.write_str("Alpha layout must be 4:0:0 but it was 4:4:4"),
+                PixelLayout::I420 => f.write_str("Alpha layout must be 4:0:0, but it was 4:2:0"),
+                PixelLayout::I422 => f.write_str("Alpha layout must be 4:0:0, but it was 4:2:2"),
+                PixelLayout::I444 => f.write_str("Alpha layout must be 4:0:0, but it was 4:4:4"),
             },
             AvifDecoderError::YuvLayoutOnIdentityMatrix(pixel_layout) => match pixel_layout {
                 PixelLayout::I400 => {
-                    f.write_str("YUV layout on 'Identity' matrix must be 4:4:4 but it was 4:0:0")
+                    f.write_str("YUV layout on 'Identity' matrix must be 4:4:4, but it was 4:0:0")
                 }
                 PixelLayout::I420 => {
-                    f.write_str("YUV layout on 'Identity' matrix must be 4:4:4 but it was 4:2:0")
+                    f.write_str("YUV layout on 'Identity' matrix must be 4:4:4, but it was 4:2:0")
                 }
                 PixelLayout::I422 => {
-                    f.write_str("YUV layout on 'Identity' matrix must be 4:4:4 but it was 4:2:2")
+                    f.write_str("YUV layout on 'Identity' matrix must be 4:4:4, but it was 4:2:2")
                 }
                 PixelLayout::I444 => unreachable!("This option must be handled correctly"),
             },
+            AvifDecoderError::UnsupportedLayoutAndMatrix(layout, matrix) => f.write_fmt(
+                format_args!("YUV layout {layout:?} on matrix {matrix:?} is not supported",),
+            ),
         }
     }
 }
@@ -253,13 +257,7 @@ fn get_matrix(
         dav1d::pixel::MatrixCoefficients::BT470BG => Ok(YuvStandardMatrix::Bt601),
         dav1d::pixel::MatrixCoefficients::ST170M => Ok(YuvStandardMatrix::Smpte240),
         dav1d::pixel::MatrixCoefficients::ST240M => Ok(YuvStandardMatrix::Smpte240),
-        // This is an experimental matrix in libavif yet.
-        dav1d::pixel::MatrixCoefficients::YCgCo => Err(ImageError::Unsupported(
-            UnsupportedError::from_format_and_kind(
-                ImageFormat::Avif.into(),
-                UnsupportedErrorKind::GenericFeature("YCgCo matrix is not supported".to_string()),
-            ),
-        )),
+        dav1d::pixel::MatrixCoefficients::YCgCo => Ok(YuvStandardMatrix::CgCo),
         dav1d::pixel::MatrixCoefficients::BT2020NonConstantLuminance => {
             Ok(YuvStandardMatrix::Bt2020)
         }
@@ -352,6 +350,18 @@ impl<R: Read> ImageDecoder for AvifDecoder<R> {
             return Err(ImageError::Decoding(DecodingError::new(
                 ImageFormat::Avif.into(),
                 AvifDecoderError::YuvLayoutOnIdentityMatrix(self.picture.pixel_layout()),
+            )));
+        }
+
+        if color_matrix == YuvStandardMatrix::CgCo
+            && self.picture.pixel_layout() == PixelLayout::I400
+        {
+            return Err(ImageError::Decoding(DecodingError::new(
+                ImageFormat::Avif.into(),
+                AvifDecoderError::UnsupportedLayoutAndMatrix(
+                    self.picture.pixel_layout(),
+                    color_matrix,
+                ),
             )));
         }
 
