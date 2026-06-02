@@ -89,14 +89,14 @@ impl<R: Read> AvifDecoder<R> {
 
         let mut primary_decoder = rav1d::rust_api::Decoder::new().map_err(error_map)?;
         primary_decoder
-            .send_data(coded.into_boxed_slice(), None, None, None)
+            .send_data(coded.to_vec().into_boxed_slice(), None, None, None)
             .map_err(error_map)?;
         let picture = read_until_ready(&mut primary_decoder)?;
         let alpha_item = ctx.alpha_item_coded_data().unwrap_or_default();
         let alpha_picture = if !alpha_item.is_empty() {
             let mut alpha_decoder = rav1d::Decoder::new().map_err(error_map)?;
             alpha_decoder
-                .send_data(alpha_item.to_vec(), None, None, None)
+                .send_data(alpha_item.to_vec().into_boxed_slice(), None, None, None)
                 .map_err(error_map)?;
             Some(read_until_ready(&mut alpha_decoder)?)
         } else {
