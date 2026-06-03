@@ -6,6 +6,8 @@ use crate::error::{
 use crate::io::{DecodedImageAttributes, DecoderPreparedImage};
 use crate::metadata::Orientation;
 use crate::{ColorType, ImageDecoder, ImageError, ImageFormat, ImageResult, Limits};
+use mp4parse::{read_avif, ImageMirror, ImageRotation, ParseStrictness};
+use rav1d::{PixelLayout, PlanarImageComponent};
 ///
 /// The [AVIF] specification defines an image derivative of the AV1 bitstream, an open video codec.
 ///
@@ -14,15 +16,14 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::io::Read;
 use std::marker::PhantomData;
-
-use crate::codecs::avif::ycgco::{
-    ycgco420_to_rgba10, ycgco420_to_rgba12, ycgco420_to_rgba8, ycgco422_to_rgba10,
-    ycgco422_to_rgba12, ycgco422_to_rgba8, ycgco444_to_rgba10, ycgco444_to_rgba12,
-    ycgco444_to_rgba8,
+use yuv::{
+    gb10_to_rgba10, gb12_to_rgba12, gbr_to_rgba, i010_to_rgba10, i012_to_rgba12, i210_to_rgba10,
+    i212_to_rgba12, i410_to_rgba10, i412_to_rgba12, icgc010_to_rgba10, icgc012_to_rgba12,
+    icgc210_to_rgba10, icgc212_to_rgba12, icgc410_to_rgba10, icgc412_to_rgba12, y010_to_rgba10,
+    y012_to_rgba12, ycgco420_to_rgba, ycgco422_to_rgba, ycgco444_to_rgba, yuv400_to_rgba,
+    yuv420_to_rgba, yuv422_to_rgba, yuv444_to_rgba, YuvGrayImage, YuvPlanarImage, YuvRange,
+    YuvStandardMatrix,
 };
-use crate::codecs::avif::yuv::*;
-use mp4parse::{read_avif, ImageMirror, ImageRotation, ParseStrictness};
-use rav1d::{PixelLayout, PlanarImageComponent};
 
 fn error_map<E: Into<Box<dyn Error + Send + Sync>>>(err: E) -> ImageError {
     ImageError::Decoding(DecodingError::new(ImageFormat::Avif.into(), err))
@@ -40,7 +41,7 @@ pub struct AvifDecoder<R> {
     limits: Limits,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum AvifDecoderError {
     AlphaPlaneFormat(PixelLayout),
     YuvLayoutOnIdentityMatrix(PixelLayout),
@@ -322,7 +323,7 @@ fn transmute_chroma_plane16<'data>(
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialOrd, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialOrd, PartialEq)]
 enum YuvMatrixStrategy {
     KrKb(YuvStandardMatrix),
     CgCo,
@@ -453,8 +454,8 @@ impl<R: Read> ImageDecoder for AvifDecoder<R> {
         }
 
         let yuv_range = match self.picture.color_range() {
-            rav1d::pixel::YUVRange::Limited => YuvIntensityRange::Tv,
-            rav1d::pixel::YUVRange::Full => YuvIntensityRange::Pc,
+            rav1d::pixel::YUVRange::Limited => YuvRange::Limited,
+            rav1d::pixel::YUVRange::Full => YuvRange::Full,
         };
 
         let matrix_strategy = get_matrix(self.picture.matrix_coefficients())?;
@@ -486,47 +487,89 @@ impl<R: Read> ImageDecoder for AvifDecoder<R> {
             let ref_u = self.picture.plane(PlanarImageComponent::U);
             let ref_v = self.picture.plane(PlanarImageComponent::V);
 
-            let image = YuvPlanarImage {
-                y_plane: ref_y.as_ref(),
-                y_stride: self.picture.stride(PlanarImageComponent::Y) as usize,
-                u_plane: ref_u.as_ref(),
-                u_stride: self.picture.stride(PlanarImageComponent::U) as usize,
-                v_plane: ref_v.as_ref(),
-                v_stride: self.picture.stride(PlanarImageComponent::V) as usize,
-                width: width as usize,
-                height: height as usize,
-            };
+            if matches!(self.picture.pixel_layout(), PixelLayout::I400) {
+                let worker = yuv400_to_rgba;
 
-            match matrix_strategy {
-                YuvMatrixStrategy::KrKb(standard) => {
-                    let worker = match self.picture.pixel_layout() {
-                        PixelLayout::I400 => yuv400_to_rgba8,
-                        PixelLayout::I420 => yuv420_to_rgba8,
-                        PixelLayout::I422 => yuv422_to_rgba8,
-                        PixelLayout::I444 => yuv444_to_rgba8,
-                    };
+                let image = YuvGrayImage {
+                    y_plane: ref_y.as_ref(),
+                    y_stride: self.picture.stride(PlanarImageComponent::Y),
+                    width,
+                    height,
+                };
 
-                    worker(image, buf, yuv_range, standard)?;
+                match matrix_strategy {
+                    YuvMatrixStrategy::KrKb(standard) => {
+                        worker(&image, buf, width * 4, yuv_range, standard).map_err(|x| {
+                            ImageError::Decoding(DecodingError::new(ImageFormat::Avif.into(), x))
+                        })?
+                    }
+                    YuvMatrixStrategy::CgCo => {
+                        return Err(ImageError::Decoding(DecodingError::new(
+                            ImageFormat::Avif.into(),
+                            AvifDecoderError::UnsupportedLayoutAndMatrix(
+                                self.picture.pixel_layout(),
+                                matrix_strategy,
+                            ),
+                        )));
+                    }
+                    YuvMatrixStrategy::Identity => {
+                        return Err(ImageError::Decoding(DecodingError::new(
+                            ImageFormat::Avif.into(),
+                            AvifDecoderError::UnsupportedLayoutAndMatrix(
+                                self.picture.pixel_layout(),
+                                matrix_strategy,
+                            ),
+                        )))
+                    }
                 }
-                YuvMatrixStrategy::CgCo => {
-                    let worker = match self.picture.pixel_layout() {
-                        PixelLayout::I400 => unreachable!(),
-                        PixelLayout::I420 => ycgco420_to_rgba8,
-                        PixelLayout::I422 => ycgco422_to_rgba8,
-                        PixelLayout::I444 => ycgco444_to_rgba8,
-                    };
+            } else {
+                let image = YuvPlanarImage {
+                    y_plane: ref_y.as_ref(),
+                    y_stride: self.picture.stride(PlanarImageComponent::Y),
+                    u_plane: ref_u.as_ref(),
+                    u_stride: self.picture.stride(PlanarImageComponent::U),
+                    v_plane: ref_v.as_ref(),
+                    v_stride: self.picture.stride(PlanarImageComponent::V),
+                    width,
+                    height,
+                };
+                match matrix_strategy {
+                    YuvMatrixStrategy::KrKb(standard) => {
+                        let worker = match self.picture.pixel_layout() {
+                            PixelLayout::I400 => unreachable!(),
+                            PixelLayout::I420 => yuv420_to_rgba,
+                            PixelLayout::I422 => yuv422_to_rgba,
+                            PixelLayout::I444 => yuv444_to_rgba,
+                        };
 
-                    worker(image, buf, yuv_range)?;
-                }
-                YuvMatrixStrategy::Identity => {
-                    let worker = match self.picture.pixel_layout() {
-                        PixelLayout::I400 => unreachable!(),
-                        PixelLayout::I420 => unreachable!(),
-                        PixelLayout::I422 => unreachable!(),
-                        PixelLayout::I444 => gbr_to_rgba8,
-                    };
+                        worker(&image, buf, width * 4, yuv_range, standard).map_err(|x| {
+                            ImageError::Decoding(DecodingError::new(ImageFormat::Avif.into(), x))
+                        })?
+                    }
+                    YuvMatrixStrategy::CgCo => {
+                        let worker = match self.picture.pixel_layout() {
+                            PixelLayout::I400 => unreachable!(),
+                            PixelLayout::I420 => ycgco420_to_rgba,
+                            PixelLayout::I422 => ycgco422_to_rgba,
+                            PixelLayout::I444 => ycgco444_to_rgba,
+                        };
 
-                    worker(image, buf, yuv_range)?;
+                        worker(&image, buf, width * 4, yuv_range).map_err(|x| {
+                            ImageError::Decoding(DecodingError::new(ImageFormat::Avif.into(), x))
+                        })?
+                    }
+                    YuvMatrixStrategy::Identity => {
+                        let worker = match self.picture.pixel_layout() {
+                            PixelLayout::I400 => unreachable!(),
+                            PixelLayout::I420 => unreachable!(),
+                            PixelLayout::I422 => unreachable!(),
+                            PixelLayout::I444 => gbr_to_rgba,
+                        };
+
+                        worker(&image, buf, width * 4, yuv_range).map_err(|x| {
+                            ImageError::Decoding(DecodingError::new(ImageFormat::Avif.into(), x))
+                        })?
+                    }
                 }
             }
 
@@ -578,7 +621,7 @@ impl<R: Read> AvifDecoder<R> {
     fn process_16bit_picture(
         &mut self,
         target: &mut [u16],
-        yuv_range: YuvIntensityRange,
+        yuv_range: YuvRange,
         matrix_strategy: YuvMatrixStrategy,
     ) -> ImageResult<()> {
         let y_rav1d_plane = self.picture.plane(PlanarImageComponent::Y);
@@ -623,92 +666,131 @@ impl<R: Read> AvifDecoder<R> {
             )?;
         }
 
-        let image = YuvPlanarImage {
-            y_plane: y_plane_view.data.as_ref(),
-            y_stride: y_plane_view.stride,
-            u_plane: u_plane_view.data.as_ref(),
-            u_stride: u_plane_view.stride,
-            v_plane: v_plane_view.data.as_ref(),
-            v_stride: v_plane_view.stride,
-            width: width as usize,
-            height: height as usize,
-        };
+        if matches!(self.picture.pixel_layout(), PixelLayout::I400) {
+            let image = YuvGrayImage {
+                y_plane: y_plane_view.data.as_ref(),
+                y_stride: y_plane_view.stride as u32,
+                width,
+                height,
+            };
+            match matrix_strategy {
+                YuvMatrixStrategy::KrKb(standard) => {
+                    let worker = if bit_depth == 10 {
+                        y010_to_rgba10
+                    } else {
+                        y012_to_rgba12
+                    };
+                    worker(&image, target, width * 4, yuv_range, standard).map_err(|x| {
+                        ImageError::Decoding(DecodingError::new(ImageFormat::Avif.into(), x))
+                    })?
+                }
+                YuvMatrixStrategy::CgCo => {
+                    return Err(ImageError::Decoding(DecodingError::new(
+                        ImageFormat::Avif.into(),
+                        AvifDecoderError::UnsupportedLayoutAndMatrix(
+                            self.picture.pixel_layout(),
+                            matrix_strategy,
+                        ),
+                    )));
+                }
+                YuvMatrixStrategy::Identity => {
+                    return Err(ImageError::Decoding(DecodingError::new(
+                        ImageFormat::Avif.into(),
+                        AvifDecoderError::UnsupportedLayoutAndMatrix(
+                            self.picture.pixel_layout(),
+                            matrix_strategy,
+                        ),
+                    )))
+                }
+            }
+        } else {
+            let image = YuvPlanarImage {
+                y_plane: y_plane_view.data.as_ref(),
+                y_stride: y_plane_view.stride as u32,
+                u_plane: u_plane_view.data.as_ref(),
+                u_stride: u_plane_view.stride as u32,
+                v_plane: v_plane_view.data.as_ref(),
+                v_stride: v_plane_view.stride as u32,
+                width,
+                height,
+            };
 
-        match matrix_strategy {
-            YuvMatrixStrategy::KrKb(standard) => {
-                let worker = match self.picture.pixel_layout() {
-                    PixelLayout::I400 => {
-                        if bit_depth == 10 {
-                            yuv400_to_rgba10
-                        } else {
-                            yuv400_to_rgba12
+            match matrix_strategy {
+                YuvMatrixStrategy::KrKb(standard) => {
+                    let worker = match self.picture.pixel_layout() {
+                        PixelLayout::I400 => unreachable!("Should be handled elsewhere"),
+                        PixelLayout::I420 => {
+                            if bit_depth == 10 {
+                                i010_to_rgba10
+                            } else {
+                                i012_to_rgba12
+                            }
                         }
-                    }
-                    PixelLayout::I420 => {
-                        if bit_depth == 10 {
-                            yuv420_to_rgba10
-                        } else {
-                            yuv420_to_rgba12
+                        PixelLayout::I422 => {
+                            if bit_depth == 10 {
+                                i210_to_rgba10
+                            } else {
+                                i212_to_rgba12
+                            }
                         }
-                    }
-                    PixelLayout::I422 => {
-                        if bit_depth == 10 {
-                            yuv422_to_rgba10
-                        } else {
-                            yuv422_to_rgba12
+                        PixelLayout::I444 => {
+                            if bit_depth == 10 {
+                                i410_to_rgba10
+                            } else {
+                                i412_to_rgba12
+                            }
                         }
-                    }
-                    PixelLayout::I444 => {
-                        if bit_depth == 10 {
-                            yuv444_to_rgba10
-                        } else {
-                            yuv444_to_rgba12
+                    };
+                    worker(&image, target, width * 4, yuv_range, standard).map_err(|x| {
+                        ImageError::Decoding(DecodingError::new(ImageFormat::Avif.into(), x))
+                    })?;
+                }
+                YuvMatrixStrategy::CgCo => {
+                    let worker = match self.picture.pixel_layout() {
+                        PixelLayout::I400 => unreachable!(),
+                        PixelLayout::I420 => {
+                            if bit_depth == 10 {
+                                icgc010_to_rgba10
+                            } else {
+                                icgc012_to_rgba12
+                            }
                         }
-                    }
-                };
-                worker(image, target, yuv_range, standard)?;
-            }
-            YuvMatrixStrategy::CgCo => {
-                let worker = match self.picture.pixel_layout() {
-                    PixelLayout::I400 => unreachable!(),
-                    PixelLayout::I420 => {
-                        if bit_depth == 10 {
-                            ycgco420_to_rgba10
-                        } else {
-                            ycgco420_to_rgba12
+                        PixelLayout::I422 => {
+                            if bit_depth == 10 {
+                                icgc210_to_rgba10
+                            } else {
+                                icgc212_to_rgba12
+                            }
                         }
-                    }
-                    PixelLayout::I422 => {
-                        if bit_depth == 10 {
-                            ycgco422_to_rgba10
-                        } else {
-                            ycgco422_to_rgba12
+                        PixelLayout::I444 => {
+                            if bit_depth == 10 {
+                                icgc410_to_rgba10
+                            } else {
+                                icgc412_to_rgba12
+                            }
                         }
-                    }
-                    PixelLayout::I444 => {
-                        if bit_depth == 10 {
-                            ycgco444_to_rgba10
-                        } else {
-                            ycgco444_to_rgba12
+                    };
+                    worker(&image, target, width * 4, yuv_range).map_err(|x| {
+                        ImageError::Decoding(DecodingError::new(ImageFormat::Avif.into(), x))
+                    })?;
+                }
+                YuvMatrixStrategy::Identity => {
+                    let worker = match self.picture.pixel_layout() {
+                        PixelLayout::I400 => unreachable!(),
+                        PixelLayout::I420 => unreachable!(),
+                        PixelLayout::I422 => unreachable!(),
+                        PixelLayout::I444 => {
+                            if bit_depth == 10 {
+                                gb10_to_rgba10
+                            } else {
+                                gb12_to_rgba12
+                            }
                         }
-                    }
-                };
-                worker(image, target, yuv_range)?;
-            }
-            YuvMatrixStrategy::Identity => {
-                let worker = match self.picture.pixel_layout() {
-                    PixelLayout::I400 => unreachable!(),
-                    PixelLayout::I420 => unreachable!(),
-                    PixelLayout::I422 => unreachable!(),
-                    PixelLayout::I444 => {
-                        if bit_depth == 10 {
-                            gbr_to_rgba10
-                        } else {
-                            gbr_to_rgba12
-                        }
-                    }
-                };
-                worker(image, target, yuv_range)?;
+                    };
+                    worker(&image, target, width * 4, yuv_range).map_err(|x| {
+                        ImageError::Decoding(DecodingError::new(ImageFormat::Avif.into(), x))
+                    })?;
+                }
             }
         }
 

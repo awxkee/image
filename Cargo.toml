@@ -70,6 +70,7 @@ zune-jpeg = { version = "0.5.15", optional = true }
 jpeg-encoder = { version = "0.7.0", optional = true, features = ["simd"] }
 serde = { version = "1.0.214", optional = true, features = ["derive"] }
 pic-scale-safe = "0.1.5"
+yuv = { version = "0.8.14", optional = true }
 
 [dev-dependencies]
 num-complex = "0.4"
@@ -105,7 +106,7 @@ webp = ["dep:image-webp"]
 rayon = ["dep:rayon", "ravif?/threading", "exr?/rayon"] # Enables multi-threading
 nasm = ["ravif?/asm"] # Enables use of nasm by rav1e (requires nasm to be installed)
 color_quant = ["dep:color_quant"] # Enables color quantization
-avif-native = ["dep:mp4parse", "dep:rav1d"] # Enable native dependency libdav1d
+avif-native = ["dep:mp4parse", "dep:rav1d", "dep:yuv"] # Enable native dependency libdav1d
 benchmarks = [] # Build some inline benchmarks. Useful only during development (requires nightly Rust)
 serde = ["dep:serde"]
 
