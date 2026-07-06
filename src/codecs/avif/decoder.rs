@@ -112,7 +112,7 @@ impl<R: Read> AvifDecoder<R> {
             8 => (),
             10 | 12 => (),
             _ => {
-                return ImageResult::Err(ImageError::Decoding(DecodingError::new(
+                return Err(ImageError::Decoding(DecodingError::new(
                     ImageFormatHint::Exact(ImageFormat::Avif),
                     format!(
                         "Avif format does not support {} bit depth",
